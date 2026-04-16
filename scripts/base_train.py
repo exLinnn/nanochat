@@ -25,7 +25,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+_arch = None  # set below after args are parsed
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -41,6 +41,22 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+# Architecture variant
+parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "swiglu", "pmem", "lnorm", "longctx"], help="model architecture variant")
+# PMem-specific architecture args
+parser.add_argument("--n-pmem-layers",   type=int,  default=6,     help="candidate tail layers for persistent memory (--arch pmem)")
+parser.add_argument("--n-pmem",          type=int,  default=16,    help="persistent memory KV slots per KV head per layer (--arch pmem/pmem2)")
+parser.add_argument("--pmem-long-only",  action="store_true",       help="only place PMem on L-window layers within the candidate range (--arch pmem)")
+parser.add_argument("--pmem-s-only",     action="store_true", default=True, help="only place PMem on S-window layers (--arch pmem2)")
+parser.add_argument("--no-pmem-s-only",  dest="pmem_s_only", action="store_false", help="allow PMem on all layers in pmem2 (disables --pmem-s-only default)")
+parser.add_argument("--pmem-use-window", action="store_true", default=True, help="respect sliding window in PMem attention context mask (--arch pmem2)")
+parser.add_argument("--no-pmem-use-window", dest="pmem_use_window", action="store_false", help="use full causal mask in PMem attention (disables --pmem-use-window default)")
+# LongCtx-specific architecture args
+parser.add_argument("--rope-base",                 type=float, default=100000.0, help="RoPE theta base (--arch longctx)")
+parser.add_argument("--rope-scaling-type",         type=str,   default="none",   choices=["none", "linear", "yarn"], help="RoPE scaling method (--arch longctx)")
+parser.add_argument("--rope-scaling-factor",       type=float, default=1.0,      help="RoPE scaling factor, e.g. 2.0 for 2x context (--arch longctx)")
+parser.add_argument("--rope-original-max-seq-len", type=int,   default=-1,       help="original pre-train seq len for RoPE scaling (-1 = use --max-seq-len) (--arch longctx)")
+parser.add_argument("--rope-dynamic-cache",        action="store_true", default=True, help="grow RoPE cache on-the-fly (--arch longctx)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -68,6 +84,7 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--resume-from-tag", type=str, default=None, help="load checkpoint from this model-tag directory instead of --model-tag (useful for cross-arch fine-tuning)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -79,6 +96,15 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# Import model based on --arch flag (must happen after args are parsed)
+if args.arch == "pmem":
+    from nanochat.gpt_pmem import GPT, GPTConfig, Linear
+elif args.arch == "longctx":
+    from nanochat.gpt_longctx import GPT, GPTConfig, Linear
+else:
+    from nanochat.gpt import GPT, GPTConfig, Linear
+
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -133,11 +159,23 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    config = GPTConfig(
+    config_kwargs = dict(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
+    if args.arch == "pmem":
+        config_kwargs["n_pmem_layers"] = args.n_pmem_layers
+        config_kwargs["n_pmem"]        = args.n_pmem
+        config_kwargs["pmem_long_only"] = args.pmem_long_only
+    if args.arch == "longctx":
+        orig_seq = args.rope_original_max_seq_len if args.rope_original_max_seq_len != -1 else args.max_seq_len
+        config_kwargs["rope_base"]                 = args.rope_base
+        config_kwargs["rope_scaling_type"]         = args.rope_scaling_type
+        config_kwargs["rope_scaling_factor"]       = args.rope_scaling_factor
+        config_kwargs["rope_original_max_seq_len"] = orig_seq
+        config_kwargs["rope_dynamic_cache"]        = args.rope_dynamic_cache
+    config = GPTConfig(**config_kwargs)
     with torch.device("meta"):
         model_meta = GPT(config)
     return model_meta
@@ -154,10 +192,13 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+# --resume-from-tag lets you load from a different model's checkpoint (e.g. fine-tune longctx from baseline d12)
+resume_dirname = args.resume_from_tag if args.resume_from_tag else output_dirname
+resume_checkpoint_dir = os.path.join(base_dir, "base_checkpoints", resume_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    print0(f"Resuming optimization from step {args.resume_from_step} (checkpoint dir: {resume_checkpoint_dir})")
+    model_data, optimizer_data, meta_data = load_checkpoint(resume_checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -391,12 +432,14 @@ def get_weight_decay(it):
 # Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
+    start_step = 0  # LR schedule counts from 0
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
+    start_step = step  # LR schedule counts relative to the resume point
     loop_state = meta_data["loop_state"]
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
@@ -414,7 +457,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Go!
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    last_step = step == start_step + num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
@@ -517,9 +560,10 @@ while True:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
+    rel_step = step - start_step  # relative step for LR schedule (0-based from resume point)
+    lrm = get_lr_multiplier(rel_step)
+    muon_momentum = get_muon_momentum(rel_step)
+    muon_weight_decay = get_weight_decay(rel_step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
@@ -548,7 +592,7 @@ while True:
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * step / num_iterations
+    pct_done = 100 * (step - start_step) / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
@@ -565,7 +609,7 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if True:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
